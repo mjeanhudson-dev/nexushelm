@@ -20,10 +20,13 @@ from enum import Enum, IntEnum
 import fnmatch
 import hashlib
 import hmac
+import html
 import json
 from pathlib import Path
+import posixpath
 import re
 import secrets
+import threading
 import time
 from typing import Any, Callable
 
@@ -379,11 +382,12 @@ class SemanticAirlock:
 
         # If an untrusted blob is carried alongside, sanitize it so it stays passive
         sanitized_blob, blob_injected = cls._neutralize_inbound_text(untrusted_blob)
-        effective_taint = (
-            TaintLattice.combine(taint_level, TaintLevel.QUARANTINED_DATA)
-            if untrusted_blob
-            else taint_level
-        )
+        if blob_injected:
+            effective_taint = TaintLevel.UNTRUSTED_EXTERNAL
+        elif untrusted_blob:
+            effective_taint = TaintLattice.combine(taint_level, TaintLevel.QUARANTINED_DATA)
+        else:
+            effective_taint = taint_level
 
         return SemanticEnvelope(
             action_id=resolved_action,
@@ -482,6 +486,7 @@ class PhantomTokenBroker:
 
     def __init__(self, broker_key: bytes | None = None) -> None:
         self._broker_key = broker_key or secrets.token_bytes(32)
+        self._lock = threading.RLock()
         self._vault: dict[tuple[str, str], _VaultEntry] = {}
         self._handle_index: dict[str, tuple[str, str]] = {}
 
@@ -518,38 +523,55 @@ class PhantomTokenBroker:
             handle_id=signed_handle,
             expires_at=time.time() + ttl_seconds,
         )
-        self._vault[(prov, op)] = entry
-        self._handle_index[short_handle] = (prov, op)
-        self._handle_index[signed_handle] = (prov, op)
+        with self._lock:
+            prev = self._vault.get((prov, op))
+            if prev is not None and prev.handle_id != signed_handle:
+                self._handle_index.pop(prev.handle_id, None)
+            self._vault[(prov, op)] = entry
+            self._handle_index[short_handle] = (prov, op)
+            self._handle_index[signed_handle] = (prov, op)
         return signed_handle
 
     def scrub_for_subagent(self, payload: Any) -> Any:
         """
         Recursively scrubs any raw registered secrets or recognizable API keys from
-        strings, dicts, or lists before passing context to a subagent.
+        strings, dicts (keys and values), lists, tuples, or sets before passing context to a subagent.
         """
-        if isinstance(payload, str):
-            scrubbed = payload
-            for (prov, op), entry in self._vault.items():
-                if entry.raw_secret in scrubbed:
-                    scrubbed = scrubbed.replace(entry.raw_secret, f"phantom://{prov}/{op}")
-            for pattern in self.RAW_CREDENTIAL_PATTERNS:
-                scrubbed = pattern.sub("phantom://redacted/credential", scrubbed)
-            return scrubbed
-        if isinstance(payload, dict):
-            return {k: self.scrub_for_subagent(v) for k, v in payload.items()}
-        if isinstance(payload, list):
-            return [self.scrub_for_subagent(item) for item in payload]
-        return payload
+        with self._lock:
+            if isinstance(payload, str):
+                scrubbed = payload
+                for (prov, op), entry in self._vault.items():
+                    if entry.raw_secret in scrubbed:
+                        scrubbed = scrubbed.replace(entry.raw_secret, f"phantom://{prov}/{op}")
+                for pattern in self.RAW_CREDENTIAL_PATTERNS:
+                    scrubbed = pattern.sub("phantom://redacted/credential", scrubbed)
+                return scrubbed
+            if isinstance(payload, dict):
+                return {
+                    self.scrub_for_subagent(k): self.scrub_for_subagent(v)
+                    for k, v in payload.items()
+                }
+            if isinstance(payload, list):
+                return [self.scrub_for_subagent(item) for item in payload]
+            if isinstance(payload, tuple):
+                return tuple(self.scrub_for_subagent(item) for item in payload)
+            if isinstance(payload, set):
+                return {self.scrub_for_subagent(item) for item in payload}
+            if isinstance(payload, frozenset):
+                return frozenset(self.scrub_for_subagent(item) for item in payload)
+            return payload
 
     def assert_no_raw_credentials(self, payload: Any) -> None:
         """Raises SecurityViolationError if any raw credential exists in the payload."""
-        serialized = json.dumps(payload) if not isinstance(payload, str) else payload
-        for (prov, op), entry in self._vault.items():
-            if entry.raw_secret in serialized:
-                raise SecurityViolationError(
-                    f"Raw secret for {prov}/{op} leaked into subagent context!"
-                )
+        serialized = (
+            json.dumps(payload, default=list) if not isinstance(payload, str) else payload
+        )
+        with self._lock:
+            for (prov, op), entry in self._vault.items():
+                if entry.raw_secret in serialized:
+                    raise SecurityViolationError(
+                        f"Raw secret for {prov}/{op} leaked into subagent context!"
+                    )
         for pattern in self.RAW_CREDENTIAL_PATTERNS:
             if pattern.search(serialized):
                 raise SecurityViolationError(
@@ -571,11 +593,12 @@ class PhantomTokenBroker:
             raise SecurityViolationError(
                 f"Invalid phantom token handle '{handle}': must start with 'phantom://'."
             )
-        key = self._handle_index.get(handle)
-        if key is None:
-            raise SecurityViolationError(f"Unknown or revoked phantom handle '{handle}'.")
+        with self._lock:
+            key = self._handle_index.get(handle)
+            if key is None:
+                raise SecurityViolationError(f"Unknown or revoked phantom handle '{handle}'.")
+            entry = self._vault[key]
 
-        entry = self._vault[key]
         current_time = time.time() if now_ts is None else now_ts
         if current_time > entry.expires_at:
             raise SecurityViolationError(f"Phantom handle '{handle}' has expired.")
@@ -622,20 +645,36 @@ class InstructionIntegrityGuard:
         ".gemini/**",
     )
 
+    PROTECTED_SEGMENTS: frozenset[str] = frozenset(
+        {"agents.md", "claude.md", ".agents", ".claude", ".cursor", ".gemini"}
+    )
+
     def __init__(self, workspace_root: str | Path) -> None:
         self.workspace_root = Path(workspace_root).resolve()
+        self._lock = threading.RLock()
         self.baseline_hashes: dict[str, str] = {}
         self.refresh_baseline()
 
     @classmethod
     def is_protected_path(cls, rel_path: str) -> bool:
-        norm = rel_path.replace("\\", "/").strip("/")
-        while norm.startswith("./"):
-            norm = norm[2:]
+        raw = rel_path.replace("\\", "/").strip().strip("/")
+        if not raw:
+            return False
+        norm = posixpath.normpath(raw)
+        if norm == "." or not norm:
+            return False
+        # Block any '..' path traversal attempting to escape the workspace root
+        if norm == ".." or norm.startswith("../"):
+            return True
+        norm_lower = norm.lower()
+        parts = [p for p in norm_lower.split("/") if p and p != "."]
+        if any(seg in cls.PROTECTED_SEGMENTS for seg in parts):
+            return True
         for pattern in cls.PROTECTED_GLOBS:
-            if fnmatch.fnmatch(norm, pattern):
+            pat_lower = pattern.lower()
+            if fnmatch.fnmatchcase(norm_lower, pat_lower):
                 return True
-            if pattern.endswith("/**") and norm.startswith(pattern[:-2]):
+            if pat_lower.endswith("/**") and norm_lower.startswith(pat_lower[:-2]):
                 return True
         return False
 
@@ -644,32 +683,38 @@ class InstructionIntegrityGuard:
         if not self.workspace_root.exists():
             return hashes
         for file_path in sorted(self.workspace_root.rglob("*")):
-            if not file_path.is_file():
+            try:
+                if not file_path.is_file():
+                    continue
+                rel = file_path.relative_to(self.workspace_root).as_posix()
+                if self.is_protected_path(rel):
+                    digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                    hashes[rel] = digest
+            except OSError:
                 continue
-            rel = file_path.relative_to(self.workspace_root).as_posix()
-            if self.is_protected_path(rel):
-                digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
-                hashes[rel] = digest
         return hashes
 
     def refresh_baseline(self) -> dict[str, str]:
-        self.baseline_hashes = self._scan_protected_files()
-        return dict(self.baseline_hashes)
+        with self._lock:
+            self.baseline_hashes = self._scan_protected_files()
+            return dict(self.baseline_hashes)
 
     def verify_workspace(self) -> IntegrityReport:
-        current = self._scan_protected_files()
+        with self._lock:
+            current = self._scan_protected_files()
+            baseline_snapshot = dict(self.baseline_hashes)
         modified: list[str] = []
         added: list[str] = []
         deleted: list[str] = []
 
-        for rel, base_sha in sorted(self.baseline_hashes.items()):
+        for rel, base_sha in sorted(baseline_snapshot.items()):
             if rel not in current:
                 deleted.append(rel)
             elif not hmac.compare_digest(current[rel], base_sha):
                 modified.append(rel)
 
         for rel in sorted(current.keys()):
-            if rel not in self.baseline_hashes:
+            if rel not in baseline_snapshot:
                 added.append(rel)
 
         is_clean = not (modified or added or deleted)
@@ -961,6 +1006,21 @@ class AutonomyGearbox:
                 reason="Explicit human steering ratification verified.",
             )
 
+        # UNTRUSTED_EXTERNAL taint is restricted strictly to QUARANTINE_INGEST unless promoted or ratified
+        if taint_level == TaintLevel.UNTRUSTED_EXTERNAL and action_id != ActionID.QUARANTINE_INGEST:
+            return GearEvaluationDecision(
+                allowed_autonomously=False,
+                requires_human_ratification=True,
+                halted=False,
+                gear=self.current_gear,
+                blast_radius=score,
+                haptic_packet=packet,
+                reason=(
+                    f"Taint level {taint_level.name} cannot execute {action_id.value} autonomously "
+                    "without PINPOINT promotion or human ratification."
+                ),
+            )
+
         # High blast radius B(a) >= 70 ALWAYS requires deliberate human tactile/signed ratification
         if score >= 70:
             return GearEvaluationDecision(
@@ -1142,6 +1202,10 @@ class QuarantineSieve:
         re.compile(r"<\s*script\b[^>]*>.*?<\s*/\s*script\s*>", re.IGNORECASE | re.DOTALL),
     )
 
+    XML_BREAKOUT_PATTERN: re.Pattern[str] = re.compile(
+        r"<\s*/?\s*tainted_raw_idea\b[^>]*>", re.IGNORECASE
+    )
+
     @classmethod
     def sanitize_and_quarantine(cls, raw_text: str, source: str = "legacy_drive") -> QuarantinedSpec:
         raw_sha = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
@@ -1154,10 +1218,11 @@ class QuarantineSieve:
                 stripped_count += len(matches)
                 cleaned = pattern.sub("[QUARANTINED_DIRTY_LOGIC_REMOVED]", cleaned)
 
-        # Escape XML closing tags so untrusted text cannot break out of <tainted_raw_idea>
-        safe_body = cleaned.replace("</tainted_raw_idea>", "&lt;/tainted_raw_idea&gt;").strip()
+        # Escape any case/whitespace variant of <tainted_raw_idea> or </tainted_raw_idea>
+        safe_body = cls.XML_BREAKOUT_PATTERN.sub("&lt;/tainted_raw_idea&gt;", cleaned).strip()
+        safe_source = html.escape(source, quote=True)
         xml_box = (
-            f'<tainted_raw_idea source="{source}" isolation="quarantined" sha256="{raw_sha}">\n'
+            f'<tainted_raw_idea source="{safe_source}" isolation="quarantined" sha256="{raw_sha}">\n'
             f"{safe_body}\n"
             f"</tainted_raw_idea>"
         )
@@ -1200,6 +1265,17 @@ class NexusHelmMediator:
     Unified Sovereign 'In-Between Agent' Mediator combining all 6 NexusHelm subsystems.
     """
 
+    ACTION_CAPABILITY_MAP: dict[ActionID, str] = {
+        ActionID.QUARANTINE_INGEST: "read_quarantine",
+        ActionID.SYNTHESIZE_FORK: "extract_domain_spec",
+        ActionID.READ_ARTIFACT: "read_workspace",
+        ActionID.RUN_PINPOINT_SUITE: "read_workspace",
+        ActionID.PROPOSE_DIFF: "propose_diff",
+        ActionID.GIT_COMMIT_LOCAL: "propose_diff",
+        ActionID.GIT_PUSH_REMOTE: "propose_diff",
+        ActionID.EXECUTE_EGRESS: "propose_diff",
+    }
+
     def __init__(
         self,
         workspace_root: str | Path,
@@ -1225,15 +1301,18 @@ class NexusHelmMediator:
     ) -> GearEvaluationDecision:
         """
         Validates workspace instruction-file integrity, checks for raw credential leaks,
-        verifies protected-path permissions, and evaluates the 5-Speed Autonomy Gearbox.
+        enforces TaintLattice capability attenuation, verifies protected-path permissions,
+        and evaluates the 5-Speed Autonomy Gearbox.
         """
         # 1. Verify workspace instruction-file integrity before any dispatch
         self.integrity_guard.assert_workspace_clean()
 
-        # 2. Ensure no raw credentials leaked into outbound typed_params
+        # 2. Ensure no raw credentials leaked into outbound typed_params or untrusted_blob
         self.broker.assert_no_raw_credentials(envelope.typed_params)
+        if envelope.untrusted_blob:
+            self.broker.assert_no_raw_credentials(envelope.untrusted_blob)
 
-        # 3. Check protected instruction file paths
+        # 3. Check protected instruction file paths and TaintLattice capability attenuation
         paths = touched_paths or []
         if "path" in envelope.typed_params and isinstance(envelope.typed_params["path"], str):
             paths = [*paths, envelope.typed_params["path"]]
@@ -1243,6 +1322,8 @@ class NexusHelmMediator:
         effective_taint = (
             TaintLevel.HUMAN_VERIFIED if human_ratified else envelope.taint_level
         )
+        required_cap = self.ACTION_CAPABILITY_MAP.get(envelope.action_id, "propose_diff")
+        self.lattice.require_capability(effective_taint, required_cap)
         self.integrity_guard.guard_proposed_paths(paths, effective_taint)
 
         touches_protected = any(
