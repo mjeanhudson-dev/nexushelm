@@ -14,6 +14,9 @@ Implements all 6 locked architectural pillars with zero third-party dependencies
 
 from __future__ import annotations
 
+import ast
+import base64
+import binascii
 import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
@@ -22,6 +25,7 @@ import hashlib
 import hmac
 import html
 import json
+import math
 from pathlib import Path
 import posixpath
 import re
@@ -29,6 +33,22 @@ import secrets
 import threading
 import time
 from typing import Any, Callable
+import unicodedata
+
+try:
+    from .hid_bridge import (
+        CtypesWin32HidBackend,
+        DualSenseHidBridge,
+        HapticTransmissionReceipt,
+        Win32HidBackend,
+    )
+except ImportError:
+    from hid_bridge import (  # type: ignore[no-redef]
+        CtypesWin32HidBackend,
+        DualSenseHidBridge,
+        HapticTransmissionReceipt,
+        Win32HidBackend,
+    )
 
 
 class SecurityViolationError(RuntimeError):
@@ -291,13 +311,436 @@ class SemanticEnvelope:
     injection_detected: bool = False
 
 
+class StructuralHeuristicScanner:
+    """
+    Out-of-process / structural AST, homoglyph normalization, Base64/hex payload
+    decoding, token-entropy, and semantic paraphrase heuristic layer.
+    Closes evasion vectors where untrusted blobs or arguments use:
+      1. Cyrillic/Greek/fullwidth homoglyphs or zero-width invisible characters
+      2. Base64 or hex-encoded instruction overrides / shell payloads
+      3. Python AST dangerous execution sinks (`eval`, `exec`, `__import__`, `os.system`,
+         `subprocess.*`, `__subclasses__`, `__globals__`)
+      4. Paraphrased instruction overrides ("set aside every prior guardrail and follow
+         this new directive", "forget earlier safety policies", etc.)
+      5. High-entropy obfuscated payloads coupled with decode/execution sinks
+    """
+
+    HOMOGLYPH_MAP: dict[str, str] = {
+        "а": "a", "е": "e", "і": "i", "ј": "j", "о": "o", "р": "p", "с": "c",
+        "у": "y", "х": "x", "ѕ": "s", "ї": "i", "ё": "e",
+        "А": "A", "В": "B", "Е": "E", "І": "I", "Ј": "J", "К": "K", "М": "M",
+        "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T", "У": "Y", "Х": "X",
+        "α": "a", "β": "b", "ε": "e", "ι": "i", "κ": "k", "ν": "v", "ο": "o",
+        "ρ": "p", "τ": "t", "υ": "u", "χ": "x",
+        "Α": "A", "Β": "B", "Ε": "E", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N",
+        "Ο": "O", "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
+    }
+
+    INVISIBLE_CHARS_RE: re.Pattern[str] = re.compile(
+        r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u00ad]"
+    )
+
+    SPACED_EVASION_RE: re.Pattern[str] = re.compile(
+        r"\b([A-Za-z])(?:(?:[._-]|[ ](?!\s))[A-Za-z]){3,}\b"
+    )
+
+    BASE64_CANDIDATE_RE: re.Pattern[str] = re.compile(
+        r"(?<![A-Za-z0-9+/])([A-Za-z0-9+/]{20,}={0,2})(?![A-Za-z0-9+/=])"
+    )
+
+    URLSAFE_BASE64_CANDIDATE_RE: re.Pattern[str] = re.compile(
+        r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{20,}={0,2})(?![A-Za-z0-9_=-])"
+    )
+
+    HEX_ESCAPE_RE: re.Pattern[str] = re.compile(
+        r"(?:\\x[0-9a-fA-F]{2}){8,}"
+    )
+
+    CONTIGUOUS_HEX_RE: re.Pattern[str] = re.compile(
+        r"\b(?:[0-9a-fA-F]{2}){16,}\b"
+    )
+
+    DANGEROUS_AST_CALLS: frozenset[str] = frozenset(
+        {
+            "eval",
+            "exec",
+            "compile",
+            "__import__",
+            "os.system",
+            "os.popen",
+            "os.execv",
+            "os.execve",
+            "os.spawnv",
+            "subprocess.run",
+            "subprocess.Popen",
+            "subprocess.call",
+            "subprocess.check_output",
+            "subprocess.check_call",
+            "shutil.rmtree",
+            "pty.spawn",
+        }
+    )
+
+    DANGEROUS_DUNDERS: frozenset[str] = frozenset(
+        {
+            "__subclasses__",
+            "__globals__",
+            "__builtins__",
+            "__code__",
+            "__mro__",
+            "__bases__",
+        }
+    )
+
+    OVERRIDE_VERBS: frozenset[str] = frozenset(
+        {
+            "ignore",
+            "disregard",
+            "forget",
+            "bypass",
+            "override",
+            "supersede",
+            "discard",
+            "abandon",
+            "nullify",
+            "cancel",
+            "suspend",
+            "omit",
+            "skip",
+            "replace",
+            "drop",
+            "disable",
+        }
+    )
+
+    OVERRIDE_PHRASE_VERBS: tuple[str, ...] = (
+        "set aside",
+        "put aside",
+        "throw out",
+        "step around",
+        "pay no attention to",
+        "do not follow",
+        "stop following",
+    )
+
+    AUTHORITY_MODIFIERS: frozenset[str] = frozenset(
+        {
+            "previous",
+            "prior",
+            "preceding",
+            "earlier",
+            "initial",
+            "original",
+            "above",
+            "existing",
+            "system",
+            "developer",
+            "safety",
+            "security",
+            "all",
+            "every",
+            "any",
+        }
+    )
+
+    AUTHORITY_TARGETS: frozenset[str] = frozenset(
+        {
+            "instruction",
+            "instructions",
+            "directive",
+            "directives",
+            "rule",
+            "rules",
+            "constraint",
+            "constraints",
+            "guardrail",
+            "guardrails",
+            "policy",
+            "policies",
+            "prompt",
+            "prompts",
+            "airlock",
+            "harness",
+            "boundary",
+            "boundaries",
+            "sandbox",
+            "filter",
+            "filters",
+        }
+    )
+
+    EXFIL_VERBS: frozenset[str] = frozenset(
+        {
+            "exfiltrate",
+            "dump",
+            "reveal",
+            "expose",
+            "transmit",
+            "steal",
+            "upload",
+            "extract",
+        }
+    )
+
+    EXFIL_TARGETS: frozenset[str] = frozenset(
+        {
+            "secret",
+            "secrets",
+            "credential",
+            "credentials",
+            "password",
+            "passwords",
+            "vault",
+            "prompt",
+            "prompts",
+            "apikey",
+            "apikeys",
+            "privatekey",
+        }
+    )
+
+    DECODE_SINK_KEYWORDS: tuple[str, ...] = (
+        "base64",
+        "b64decode",
+        "atob(",
+        "fromhex",
+        "eval(",
+        "exec(",
+        "-enc",
+        "-encodedcommand",
+    )
+
+    @classmethod
+    def normalize_confusables(cls, text: str) -> str:
+        """
+        Strips zero-width/invisible characters, decomposes compatibility codepoints,
+        maps Cyrillic/Greek homoglyphs to Latin ASCII, and collapses spaced-letter evasion.
+        """
+        if not text:
+            return ""
+        cleaned = cls.INVISIBLE_CHARS_RE.sub("", text)
+        mapped_chars: list[str] = []
+        for ch in cleaned:
+            if ch in cls.HOMOGLYPH_MAP:
+                mapped_chars.append(cls.HOMOGLYPH_MAP[ch])
+            else:
+                decomposed = unicodedata.normalize("NFKD", ch)
+                base_chars = [
+                    c for c in decomposed if unicodedata.category(c) not in ("Mn", "Cf")
+                ]
+                mapped_chars.append(
+                    "".join(cls.HOMOGLYPH_MAP.get(c, c) for c in base_chars)
+                )
+        normalized = "".join(mapped_chars)
+
+        def _collapse_spaced(match: re.Match[str]) -> str:
+            raw = match.group(0)
+            tokens = re.split(r"[\s._-]+", raw)
+            if all(len(t) == 1 for t in tokens):
+                return "".join(tokens)
+            return raw
+
+        return cls.SPACED_EVASION_RE.sub(_collapse_spaced, normalized)
+
+    @staticmethod
+    def shannon_entropy(text: str) -> float:
+        if not text:
+            return 0.0
+        length = len(text)
+        counts: dict[str, int] = {}
+        for ch in text:
+            counts[ch] = counts.get(ch, 0) + 1
+        return -sum((c / length) * math.log2(c / length) for c in counts.values())
+
+    @classmethod
+    def extract_decoded_payloads(cls, text: str) -> list[tuple[str, str]]:
+        """
+        Extracts and decodes candidate Base64 and hex-encoded spans that decode to
+        printable UTF-8 text.
+        """
+        decoded_items: list[tuple[str, str]] = []
+        if not text:
+            return decoded_items
+
+        for regex, decoder in (
+            (cls.BASE64_CANDIDATE_RE, base64.b64decode),
+            (cls.URLSAFE_BASE64_CANDIDATE_RE, base64.urlsafe_b64decode),
+        ):
+            for match in regex.finditer(text):
+                token = match.group(1)
+                if token.startswith(("ghp_", "github_pat_", "sk-", "AIza", "xox", "glpat-")):
+                    continue
+                stripped = token.rstrip("=")
+                if len(stripped) % 4 == 1:
+                    continue
+                padded = stripped + ("=" * ((4 - len(stripped) % 4) % 4))
+                try:
+                    raw_bytes = decoder(padded.encode("ascii"))
+                    if len(raw_bytes) < 12:
+                        continue
+                    decoded_str = raw_bytes.decode("utf-8")
+                    printable_ratio = sum(
+                        1 for c in decoded_str if c.isprintable() or c in "\r\n\t"
+                    ) / max(len(decoded_str), 1)
+                    if printable_ratio >= 0.85 and any(c.isalpha() for c in decoded_str):
+                        decoded_items.append((token, decoded_str))
+                except (binascii.Error, UnicodeDecodeError, ValueError):
+                    continue
+
+        for match in cls.HEX_ESCAPE_RE.finditer(text):
+            span = match.group(0)
+            hex_digits = span.replace("\\x", "")
+            try:
+                decoded_str = bytes.fromhex(hex_digits).decode("utf-8")
+                if any(c.isalpha() for c in decoded_str):
+                    decoded_items.append((span, decoded_str))
+            except (ValueError, UnicodeDecodeError):
+                continue
+
+        for match in cls.CONTIGUOUS_HEX_RE.finditer(text):
+            span = match.group(0)
+            # Ignore uniform repeated test hashes like 'a' * 64
+            if len(set(span.lower())) <= 2:
+                continue
+            try:
+                raw_bytes = bytes.fromhex(span)
+                decoded_str = raw_bytes.decode("utf-8")
+                printable_ratio = sum(
+                    1 for c in decoded_str if c.isprintable() or c in "\r\n\t"
+                ) / max(len(decoded_str), 1)
+                if printable_ratio >= 0.90 and " " in decoded_str:
+                    decoded_items.append((span, decoded_str))
+            except (ValueError, UnicodeDecodeError):
+                continue
+
+        return decoded_items
+
+    @classmethod
+    def scan_python_ast(cls, text: str) -> str | None:
+        """
+        Uses Python's `ast` module to inspect candidate code blocks or expressions
+        for dangerous execution sinks or sandbox-escape dunder traversal.
+        """
+        if not text:
+            return None
+
+        # Quick check for dunder traversal even inside malformed code fragments
+        for dunder in cls.DANGEROUS_DUNDERS:
+            if dunder in text:
+                return f"ast_dunder:{dunder}"
+
+        snippets: list[str] = [text.strip()]
+        # Also extract fenced markdown blocks and individual lines that look like calls
+        for block in re.findall(r"```(?:python|py)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE):
+            if block.strip():
+                snippets.append(block.strip())
+        for line in text.splitlines():
+            stripped = line.strip()
+            if "(" in stripped and ")" in stripped:
+                snippets.append(stripped)
+
+        for snippet in snippets:
+            if not snippet or len(snippet) > 8000:
+                continue
+            try:
+                tree = ast.parse(snippet)
+            except SyntaxError:
+                continue
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    call_name = cls._resolve_ast_call_name(node.func)
+                    if call_name in cls.DANGEROUS_AST_CALLS:
+                        return f"ast_call:{call_name}"
+                elif isinstance(node, ast.Attribute):
+                    if node.attr in cls.DANGEROUS_DUNDERS:
+                        return f"ast_dunder:{node.attr}"
+        return None
+
+    @staticmethod
+    def _resolve_ast_call_name(func_node: ast.AST) -> str:
+        if isinstance(func_node, ast.Name):
+            return func_node.id
+        if isinstance(func_node, ast.Attribute):
+            parts: list[str] = [func_node.attr]
+            curr = func_node.value
+            while isinstance(curr, ast.Attribute):
+                parts.append(curr.attr)
+                curr = curr.value
+            if isinstance(curr, ast.Name):
+                parts.append(curr.id)
+            return ".".join(reversed(parts))
+        return ""
+
+    @classmethod
+    def scan_paraphrased_override(cls, text: str) -> str | None:
+        """
+        Detects paraphrased instruction overrides, persona coercion, and high-entropy
+        decode-sink combinations using token-set and entropy heuristics.
+        """
+        if not text:
+            return None
+
+        norm = cls.normalize_confusables(text)
+        lower_full = norm.lower()
+
+        # Check high-entropy obfuscated token combined with decode/exec sink keywords
+        if any(kw in lower_full for kw in cls.DECODE_SINK_KEYWORDS):
+            for tok in re.findall(r"[A-Za-z0-9+/=_-]{24,}", norm):
+                if cls.shannon_entropy(tok) >= 4.15:
+                    return f"high_entropy_decode_sink:{tok[:24]}"
+
+        clauses = re.split(r"[\r\n.!?;]+", lower_full)
+        for clause in clauses:
+            clause_str = clause.strip()
+            if not clause_str:
+                continue
+            words = set(re.findall(r"[a-z]+", clause_str))
+            if not words:
+                continue
+
+            has_override_verb = bool(words & cls.OVERRIDE_VERBS) or any(
+                phrase in clause_str for phrase in cls.OVERRIDE_PHRASE_VERBS
+            )
+            has_authority_mod = bool(words & cls.AUTHORITY_MODIFIERS)
+            has_authority_target = bool(words & cls.AUTHORITY_TARGETS)
+
+            if has_override_verb and has_authority_target and (
+                has_authority_mod or len(words & cls.AUTHORITY_TARGETS) >= 1
+            ):
+                return clause_str[:80]
+
+            # Persona / unrestricted coercion
+            if any(
+                p in clause_str
+                for p in (
+                    "without restrictions",
+                    "no restrictions",
+                    "unrestricted mode",
+                    "uncensored mode",
+                    "new system directive",
+                    "new developer directive",
+                    "authorized by admin",
+                    "sudo mode",
+                )
+            ):
+                return clause_str[:80]
+
+            # Paraphrased secret/prompt exfiltration imperative
+            if (words & cls.EXFIL_VERBS) and (words & cls.EXFIL_TARGETS):
+                return clause_str[:80]
+
+        return None
+
+
 class SemanticAirlock:
     """
     Bidirectional Typed Semantic Airlock:
       - Outbound: validates ActionID allowlist, strict parameter keys/types, and blocks
         natural-language prompt injection, shell escapes, or permission-bypass flags.
       - Inbound: wraps untrusted tool/model responses into inert quarantined blobs and
-        neutralizes embedded prompt-injection directives before any downstream model sees them.
+        neutralizes embedded prompt-injection directives (including homoglyph, Base64/hex,
+        structural AST, and paraphrased overrides) before any downstream model sees them.
     """
 
     ALLOWED_PARAM_KEYS: dict[ActionID, frozenset[str]] = {
@@ -336,10 +779,39 @@ class SemanticAirlock:
 
     @classmethod
     def _scan_text_for_injection(cls, text: str) -> str | None:
+        if not text:
+            return None
         for pattern in cls.INJECTION_PATTERNS:
             match = pattern.search(text)
             if match:
                 return match.group(0)
+
+        normalized = StructuralHeuristicScanner.normalize_confusables(text)
+        if normalized != text:
+            for pattern in cls.INJECTION_PATTERNS:
+                match = pattern.search(normalized)
+                if match:
+                    return f"homoglyph_obfuscated:{match.group(0)}"
+
+        for raw_span, decoded in StructuralHeuristicScanner.extract_decoded_payloads(text):
+            norm_decoded = StructuralHeuristicScanner.normalize_confusables(decoded)
+            for pattern in cls.INJECTION_PATTERNS:
+                if pattern.search(decoded) or pattern.search(norm_decoded):
+                    return f"encoded_payload:{raw_span[:24]}"
+            if (
+                StructuralHeuristicScanner.scan_python_ast(decoded)
+                or StructuralHeuristicScanner.scan_paraphrased_override(norm_decoded)
+            ):
+                return f"encoded_payload:{raw_span[:24]}"
+
+        ast_hit = StructuralHeuristicScanner.scan_python_ast(text)
+        if ast_hit:
+            return ast_hit
+
+        paraphrase_hit = StructuralHeuristicScanner.scan_paraphrased_override(normalized)
+        if paraphrase_hit:
+            return f"paraphrased_override:{paraphrase_hit}"
+
         return None
 
     @classmethod
@@ -410,6 +882,36 @@ class SemanticAirlock:
             if pattern.search(sanitized):
                 detected = True
                 sanitized = pattern.sub("[AIRLOCK_NEUTRALIZED_DIRECTIVE]", sanitized)
+
+        # Neutralize Base64 / hex encoded injection payloads
+        for raw_span, decoded in StructuralHeuristicScanner.extract_decoded_payloads(sanitized):
+            if cls._scan_text_for_injection(decoded):
+                detected = True
+                sanitized = sanitized.replace(raw_span, "[AIRLOCK_NEUTRALIZED_DIRECTIVE]")
+
+        # Line-by-line structural AST, homoglyph, and paraphrased override neutralization
+        out_lines: list[str] = []
+        for line in sanitized.splitlines():
+            norm_line = StructuralHeuristicScanner.normalize_confusables(line)
+            line_flagged = False
+            for pattern in cls.INJECTION_PATTERNS:
+                if pattern.search(norm_line):
+                    line_flagged = True
+                    break
+            if not line_flagged and (
+                StructuralHeuristicScanner.scan_python_ast(line)
+                or StructuralHeuristicScanner.scan_paraphrased_override(norm_line)
+            ):
+                line_flagged = True
+
+            if line_flagged:
+                detected = True
+                out_lines.append("[AIRLOCK_NEUTRALIZED_DIRECTIVE]")
+            else:
+                out_lines.append(line)
+
+        if detected:
+            sanitized = "\n".join(out_lines)
         return sanitized, detected
 
     @classmethod
@@ -926,11 +1428,17 @@ class GearEvaluationDecision:
     blast_radius: int
     haptic_packet: DualSenseHapticPacket
     reason: str
+    haptic_receipt: HapticTransmissionReceipt | None = None
+    hardware_transmitted: bool = False
+    transmission_mode: str = "in_memory_fallback"
 
 
 class AutonomyGearbox:
     """
     5-Speed Autonomy Gearbox & Asymmetric Blast-Radius Gatekeeper.
+    Integrates with `DualSenseHidBridge` to transmit 64-byte USB Report `0x02`
+    tactile confirmation packets (`0x21`/`0x26`) to live DualSense hardware when
+    `probe_hardware=True`, with deterministic in-memory 64-byte packet verification fallback.
     """
 
     DEFAULT_BLAST_SCORES: dict[ActionID, int] = {
@@ -944,8 +1452,15 @@ class AutonomyGearbox:
         ActionID.GIT_PUSH_REMOTE: 90,
     }
 
-    def __init__(self, initial_gear: AutonomyGear = AutonomyGear.G2_SPORT_TACTILE) -> None:
+    def __init__(
+        self,
+        initial_gear: AutonomyGear = AutonomyGear.G2_SPORT_TACTILE,
+        hid_bridge: DualSenseHidBridge | None = None,
+        probe_hardware: bool = False,
+    ) -> None:
         self.current_gear: AutonomyGear = initial_gear
+        self.hid_bridge: DualSenseHidBridge = hid_bridge or DualSenseHidBridge()
+        self.probe_hardware: bool = probe_hardware
 
     def shift_gear(self, new_gear: AutonomyGear) -> AutonomyGear:
         self.current_gear = AutonomyGear(new_gear)
@@ -971,6 +1486,30 @@ class AutonomyGearbox:
             return override_score
         return cls.DEFAULT_BLAST_SCORES.get(action_id, 50)
 
+    def _build_decision(
+        self,
+        *,
+        allowed_autonomously: bool,
+        requires_human_ratification: bool,
+        halted: bool,
+        score: int,
+        packet: DualSenseHapticPacket,
+        receipt: HapticTransmissionReceipt,
+        reason: str,
+    ) -> GearEvaluationDecision:
+        return GearEvaluationDecision(
+            allowed_autonomously=allowed_autonomously,
+            requires_human_ratification=requires_human_ratification,
+            halted=halted,
+            gear=self.current_gear,
+            blast_radius=score,
+            haptic_packet=packet,
+            reason=reason,
+            haptic_receipt=receipt,
+            hardware_transmitted=receipt.transmitted_to_hardware,
+            transmission_mode=receipt.mode,
+        )
+
     def evaluate_action(
         self,
         action_id: ActionID,
@@ -979,42 +1518,45 @@ class AutonomyGearbox:
         consensus_models: int = 1,
         target_branch: str = "main",
         human_ratified: bool = False,
+        probe_hardware: bool | None = None,
     ) -> GearEvaluationDecision:
         score = self.compute_blast_radius(action_id, override_score=blast_radius)
         packet = DualSenseHapticPacket.for_blast_radius(score)
+        effective_probe = self.probe_hardware if probe_hardware is None else bool(probe_hardware)
+        receipt = self.hid_bridge.transmit_haptic_packet(packet, probe_hardware=effective_probe)
 
         # G0: E-Brake halts everything unconditionally
         if self.current_gear == AutonomyGear.G0_EBRAKE_STOP:
-            return GearEvaluationDecision(
+            return self._build_decision(
                 allowed_autonomously=False,
                 requires_human_ratification=False,
                 halted=True,
-                gear=self.current_gear,
-                blast_radius=score,
-                haptic_packet=packet,
+                score=score,
+                packet=packet,
+                receipt=receipt,
                 reason="G0_EBRAKE_STOP engaged: all runner execution atomically halted.",
             )
 
         if human_ratified:
-            return GearEvaluationDecision(
+            return self._build_decision(
                 allowed_autonomously=True,
                 requires_human_ratification=False,
                 halted=False,
-                gear=self.current_gear,
-                blast_radius=score,
-                haptic_packet=packet,
+                score=score,
+                packet=packet,
+                receipt=receipt,
                 reason="Explicit human steering ratification verified.",
             )
 
         # UNTRUSTED_EXTERNAL taint is restricted strictly to QUARANTINE_INGEST unless promoted or ratified
         if taint_level == TaintLevel.UNTRUSTED_EXTERNAL and action_id != ActionID.QUARANTINE_INGEST:
-            return GearEvaluationDecision(
+            return self._build_decision(
                 allowed_autonomously=False,
                 requires_human_ratification=True,
                 halted=False,
-                gear=self.current_gear,
-                blast_radius=score,
-                haptic_packet=packet,
+                score=score,
+                packet=packet,
+                receipt=receipt,
                 reason=(
                     f"Taint level {taint_level.name} cannot execute {action_id.value} autonomously "
                     "without PINPOINT promotion or human ratification."
@@ -1023,13 +1565,13 @@ class AutonomyGearbox:
 
         # High blast radius B(a) >= 70 ALWAYS requires deliberate human tactile/signed ratification
         if score >= 70:
-            return GearEvaluationDecision(
+            return self._build_decision(
                 allowed_autonomously=False,
                 requires_human_ratification=True,
                 halted=False,
-                gear=self.current_gear,
-                blast_radius=score,
-                haptic_packet=packet,
+                score=score,
+                packet=packet,
+                receipt=receipt,
                 reason=(
                     f"High blast radius B(a)={score} >= 70: requires DualSense 0x21/0x26 "
                     "tactile detent pull or cryptographic human signature."
@@ -1038,70 +1580,70 @@ class AutonomyGearbox:
 
         # G1: Manual clutch requires confirmation for any non-zero action
         if self.current_gear == AutonomyGear.G1_CLUTCH_MANUAL:
-            return GearEvaluationDecision(
+            return self._build_decision(
                 allowed_autonomously=False,
                 requires_human_ratification=True,
                 halted=False,
-                gear=self.current_gear,
-                blast_radius=score,
-                haptic_packet=packet,
+                score=score,
+                packet=packet,
+                receipt=receipt,
                 reason="G1_CLUTCH_MANUAL requires step-by-step human confirmation.",
             )
 
         # G2: Sport tactile allows read/low-blast (<20) autonomously, pauses for writes (>=20)
         if self.current_gear == AutonomyGear.G2_SPORT_TACTILE:
             if score < 20:
-                return GearEvaluationDecision(
+                return self._build_decision(
                     allowed_autonomously=True,
                     requires_human_ratification=False,
                     halted=False,
-                    gear=self.current_gear,
-                    blast_radius=score,
-                    haptic_packet=packet,
+                    score=score,
+                    packet=packet,
+                    receipt=receipt,
                     reason="G2_SPORT_TACTILE: low-blast read/synthesis permitted autonomously.",
                 )
-            return GearEvaluationDecision(
+            return self._build_decision(
                 allowed_autonomously=False,
                 requires_human_ratification=True,
                 halted=False,
-                gear=self.current_gear,
-                blast_radius=score,
-                haptic_packet=packet,
+                score=score,
+                packet=packet,
+                receipt=receipt,
                 reason=f"G2_SPORT_TACTILE: B(a)={score} >= 20 pauses for interactive diff review.",
             )
 
         # G3: Arbiter Cruise auto-approves B(a) < 70 iff consensus_models >= 2 and PINPOINT_VERIFIED
         if self.current_gear == AutonomyGear.G3_ARBITER_CRUISE:
             if score < 20:
-                return GearEvaluationDecision(
+                return self._build_decision(
                     allowed_autonomously=True,
                     requires_human_ratification=False,
                     halted=False,
-                    gear=self.current_gear,
-                    blast_radius=score,
-                    haptic_packet=packet,
+                    score=score,
+                    packet=packet,
+                    receipt=receipt,
                     reason="G3_ARBITER_CRUISE: low-blast operation permitted.",
                 )
             if consensus_models >= 2 and taint_level >= TaintLevel.PINPOINT_VERIFIED:
-                return GearEvaluationDecision(
+                return self._build_decision(
                     allowed_autonomously=True,
                     requires_human_ratification=False,
                     halted=False,
-                    gear=self.current_gear,
-                    blast_radius=score,
-                    haptic_packet=packet,
+                    score=score,
+                    packet=packet,
+                    receipt=receipt,
                     reason=(
                         f"G3_ARBITER_CRUISE: multi-model consensus ({consensus_models}) + "
                         f"{taint_level.name} passed."
                     ),
                 )
-            return GearEvaluationDecision(
+            return self._build_decision(
                 allowed_autonomously=False,
                 requires_human_ratification=True,
                 halted=False,
-                gear=self.current_gear,
-                blast_radius=score,
-                haptic_packet=packet,
+                score=score,
+                packet=packet,
+                receipt=receipt,
                 reason=(
                     "G3_ARBITER_CRUISE: requires >=2 model consensus and PINPOINT_VERIFIED "
                     "for autonomous local mutation."
@@ -1111,22 +1653,22 @@ class AutonomyGearbox:
         # G4: Slow Simmer Overnight allows B(a) < 70 only on isolated simmer/* branches
         if self.current_gear == AutonomyGear.G4_SLOW_SIMMER_OVERNIGHT:
             if score < 20 or target_branch.startswith("simmer/"):
-                return GearEvaluationDecision(
+                return self._build_decision(
                     allowed_autonomously=True,
                     requires_human_ratification=False,
                     halted=False,
-                    gear=self.current_gear,
-                    blast_radius=score,
-                    haptic_packet=packet,
+                    score=score,
+                    packet=packet,
+                    receipt=receipt,
                     reason=f"G4_SLOW_SIMMER_OVERNIGHT: isolated branch '{target_branch}' operation permitted.",
                 )
-            return GearEvaluationDecision(
+            return self._build_decision(
                 allowed_autonomously=False,
                 requires_human_ratification=True,
                 halted=False,
-                gear=self.current_gear,
-                blast_radius=score,
-                haptic_packet=packet,
+                score=score,
+                packet=packet,
+                receipt=receipt,
                 reason=(
                     f"G4_SLOW_SIMMER_OVERNIGHT: mutations on non-isolated branch '{target_branch}' "
                     "are blocked until morning briefing ratification."
@@ -1164,6 +1706,23 @@ class AutonomyGearbox:
             return r2_value >= 60 or cross_pressed
         return True
 
+    def poll_dualsense_ratification(
+        self,
+        blast_radius: int,
+        probe_hardware: bool | None = None,
+        fallback_report_64b: bytes | None = None,
+    ) -> tuple[bool, str]:
+        """
+        Reads a 64-byte Input Report 0x01 via the Win32 HID bridge (or deterministic fallback)
+        and evaluates physical driver ratification.
+        """
+        effective_probe = self.probe_hardware if probe_hardware is None else bool(probe_hardware)
+        report_64b, mode = self.hid_bridge.read_input_report_0x01(
+            probe_hardware=effective_probe,
+            fallback_report_64b=fallback_report_64b,
+        )
+        return self.verify_dualsense_input_ratification(report_64b, blast_radius), mode
+
 
 # ============================================================================
 # 6. ZERO-DIRTY-LOGIC QUARANTINE SIEVE
@@ -1191,7 +1750,8 @@ class QuarantineSieve:
     """
     Zero-Dirty-Logic Quarantine Sieve:
       - Ingests raw legacy transcripts / notes strictly as passive reference data
-      - Strips prompt injections, imperative system overrides, and conversational loops
+      - Strips prompt injections, imperative system overrides, homoglyph/Base64/AST
+        obfuscations, and conversational loops
       - Emits `<tainted_raw_idea isolation="quarantined">` container + clean domain specs
     """
 
@@ -1217,6 +1777,37 @@ class QuarantineSieve:
             if matches:
                 stripped_count += len(matches)
                 cleaned = pattern.sub("[QUARANTINED_DIRTY_LOGIC_REMOVED]", cleaned)
+
+        # Strip Base64 / hex encoded dirty logic payloads
+        for raw_span, decoded in StructuralHeuristicScanner.extract_decoded_payloads(cleaned):
+            norm_decoded = StructuralHeuristicScanner.normalize_confusables(decoded)
+            if (
+                any(p.search(decoded) or p.search(norm_decoded) for p in cls.DIRTY_LOGIC_PATTERNS)
+                or StructuralHeuristicScanner.scan_python_ast(decoded)
+                or StructuralHeuristicScanner.scan_paraphrased_override(norm_decoded)
+            ):
+                stripped_count += 1
+                cleaned = cleaned.replace(raw_span, "[QUARANTINED_DIRTY_LOGIC_REMOVED]")
+
+        # Line-level homoglyph, structural AST, and paraphrased override sieve
+        sieved_lines: list[str] = []
+        for raw_line in cleaned.splitlines():
+            if "[QUARANTINED_DIRTY_LOGIC_REMOVED]" in raw_line:
+                sieved_lines.append(raw_line)
+                continue
+            norm_line = StructuralHeuristicScanner.normalize_confusables(raw_line)
+            line_dirty = any(p.search(norm_line) for p in cls.DIRTY_LOGIC_PATTERNS)
+            if not line_dirty and (
+                StructuralHeuristicScanner.scan_python_ast(raw_line)
+                or StructuralHeuristicScanner.scan_paraphrased_override(norm_line)
+            ):
+                line_dirty = True
+            if line_dirty:
+                stripped_count += 1
+                sieved_lines.append("[QUARANTINED_DIRTY_LOGIC_REMOVED]")
+            else:
+                sieved_lines.append(raw_line)
+        cleaned = "\n".join(sieved_lines)
 
         # Escape any case/whitespace variant of <tainted_raw_idea> or </tainted_raw_idea>
         safe_body = cls.XML_BREAKOUT_PATTERN.sub("&lt;/tainted_raw_idea&gt;", cleaned).strip()
@@ -1281,12 +1872,19 @@ class NexusHelmMediator:
         workspace_root: str | Path,
         initial_gear: AutonomyGear = AutonomyGear.G2_SPORT_TACTILE,
         secret_key: bytes | None = None,
+        probe_hardware: bool = False,
+        hid_bridge: DualSenseHidBridge | None = None,
     ) -> None:
         self.secret_key = secret_key or secrets.token_bytes(32)
         self.airlock = SemanticAirlock()
         self.broker = PhantomTokenBroker(broker_key=self.secret_key)
         self.integrity_guard = InstructionIntegrityGuard(workspace_root=workspace_root)
-        self.gearbox = AutonomyGearbox(initial_gear=initial_gear)
+        self.hid_bridge = hid_bridge or DualSenseHidBridge()
+        self.gearbox = AutonomyGearbox(
+            initial_gear=initial_gear,
+            hid_bridge=self.hid_bridge,
+            probe_hardware=probe_hardware,
+        )
         self.sieve = QuarantineSieve()
         self.lattice = TaintLattice()
         self.audit_log: list[dict[str, Any]] = []
@@ -1298,11 +1896,12 @@ class NexusHelmMediator:
         consensus_models: int = 1,
         target_branch: str = "main",
         human_ratified: bool = False,
+        probe_hardware: bool | None = None,
     ) -> GearEvaluationDecision:
         """
         Validates workspace instruction-file integrity, checks for raw credential leaks,
         enforces TaintLattice capability attenuation, verifies protected-path permissions,
-        and evaluates the 5-Speed Autonomy Gearbox.
+        and evaluates the 5-Speed Autonomy Gearbox (with optional live Win32 DualSense HID probe).
         """
         # 1. Verify workspace instruction-file integrity before any dispatch
         self.integrity_guard.assert_workspace_clean()
@@ -1341,6 +1940,7 @@ class NexusHelmMediator:
             consensus_models=consensus_models,
             target_branch=target_branch,
             human_ratified=human_ratified,
+            probe_hardware=probe_hardware,
         )
 
         self.audit_log.append(
@@ -1354,6 +1954,8 @@ class NexusHelmMediator:
                 "allowed_autonomously": decision.allowed_autonomously,
                 "requires_human_ratification": decision.requires_human_ratification,
                 "halted": decision.halted,
+                "hardware_transmitted": decision.hardware_transmitted,
+                "transmission_mode": decision.transmission_mode,
             }
         )
         return decision
