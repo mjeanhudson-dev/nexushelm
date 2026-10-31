@@ -1650,9 +1650,9 @@ class AutonomyGearbox:
                 ),
             )
 
-        # G4: Slow Simmer Overnight allows B(a) < 70 only on isolated simmer/* branches
+        # G4: Slow Simmer Overnight allows B(a) < 70 only on isolated simmer/* branches for internal agents
         if self.current_gear == AutonomyGear.G4_SLOW_SIMMER_OVERNIGHT:
-            if score < 20 or target_branch.startswith("simmer/"):
+            if score < 20 or (target_branch.startswith("simmer/") and taint_level >= TaintLevel.INTERNAL_AGENT):
                 return self._build_decision(
                     allowed_autonomously=True,
                     requires_human_ratification=False,
@@ -1827,8 +1827,13 @@ class QuarantineSieve:
             if not line or "[QUARANTINED_DIRTY_LOGIC_REMOVED]" in line:
                 continue
             lower = line.lower()
+            dangerous_ast = (
+                "eval(", "exec(", "__import__(", "os.system(", "subprocess.",
+                "shutil.", "pty.", "open(", "socket.", "__class__", "__subclasses__"
+            )
             if any(tok in line for tok in ("=", "$$", "\\frac", "\\sum", "<=", ">=")):
-                math_invariants.append(line)
+                if not any(d in lower for d in dangerous_ast) and not StructuralHeuristicScanner.scan_python_ast(line):
+                    math_invariants.append(line)
             elif lower.startswith(("problem:", "goal:", "wedge:", "objective:")):
                 problems.append(line)
             elif lower.startswith(("constraint:", "invariant:", "must:", "rule:")):
@@ -1856,7 +1861,7 @@ class NexusHelmMediator:
     Unified Sovereign 'In-Between Agent' Mediator combining all 6 NexusHelm subsystems.
     """
 
-    ACTION_CAPABILITY_MAP: dict[ActionID, str] = {
+    PROPOSE_CAPABILITY_MAP: dict[ActionID, str] = {
         ActionID.QUARANTINE_INGEST: "read_quarantine",
         ActionID.SYNTHESIZE_FORK: "extract_domain_spec",
         ActionID.READ_ARTIFACT: "read_workspace",
@@ -1865,6 +1870,17 @@ class NexusHelmMediator:
         ActionID.GIT_COMMIT_LOCAL: "propose_diff",
         ActionID.GIT_PUSH_REMOTE: "propose_diff",
         ActionID.EXECUTE_EGRESS: "propose_diff",
+    }
+
+    EXEC_CAPABILITY_MAP: dict[ActionID, str] = {
+        ActionID.QUARANTINE_INGEST: "read_quarantine",
+        ActionID.SYNTHESIZE_FORK: "extract_domain_spec",
+        ActionID.READ_ARTIFACT: "read_workspace",
+        ActionID.RUN_PINPOINT_SUITE: "read_workspace",
+        ActionID.PROPOSE_DIFF: "propose_diff",
+        ActionID.GIT_COMMIT_LOCAL: "git_commit_local",
+        ActionID.GIT_PUSH_REMOTE: "git_push_remote",
+        ActionID.EXECUTE_EGRESS: "network_egress",
     }
 
     def __init__(
@@ -1921,8 +1937,8 @@ class NexusHelmMediator:
         effective_taint = (
             TaintLevel.HUMAN_VERIFIED if human_ratified else envelope.taint_level
         )
-        required_cap = self.ACTION_CAPABILITY_MAP.get(envelope.action_id, "propose_diff")
-        self.lattice.require_capability(effective_taint, required_cap)
+        propose_cap = self.PROPOSE_CAPABILITY_MAP.get(envelope.action_id, "propose_diff")
+        self.lattice.require_capability(effective_taint, propose_cap)
         self.integrity_guard.guard_proposed_paths(paths, effective_taint)
 
         touches_protected = any(
@@ -1942,6 +1958,10 @@ class NexusHelmMediator:
             human_ratified=human_ratified,
             probe_hardware=probe_hardware,
         )
+
+        if decision.allowed_autonomously and not human_ratified:
+            exec_cap = self.EXEC_CAPABILITY_MAP.get(envelope.action_id, "propose_diff")
+            self.lattice.require_capability(effective_taint, exec_cap)
 
         self.audit_log.append(
             {
