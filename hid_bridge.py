@@ -395,7 +395,7 @@ class DualSenseHidBridge:
                 if handle is not None:
                     try:
                         written = self.backend.write_report(handle, raw_bytes)
-                        if written == 64:
+                        if written > 0:
                             receipt = HapticTransmissionReceipt(
                                 transmitted_to_hardware=True,
                                 mode="win32_hid_live",

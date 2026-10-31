@@ -32,6 +32,7 @@ def run_demo() -> int:
         mediator = NexusHelmMediator(
             workspace_root=root,
             initial_gear=AutonomyGear.G3_ARBITER_CRUISE,
+            probe_hardware=True,
         )
 
         # 1. Quarantine Sieve
